@@ -3,7 +3,7 @@ import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
 import SessionStore from '@deepseek-ai/dsh-session'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
-import type { ApiProxy, MuxFrame, RpcRequest } from '@deepseek-ai/dsh-host-apiproxy/api'
+import type { ApiProxy, MuxFrame, RpcRequest, StreamFrame } from '@deepseek-ai/dsh-host-apiproxy/api'
 import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api/rpc'
 import { createApiProxy } from '../src/api-proxy.ts'
 
@@ -26,10 +26,10 @@ function agent(ctx: Context): Agent {
 }
 
 function openMux(api: ApiProxy, abort: AbortController): {
-  envelopes: RpcRequest<MuxFrame>[]
+  envelopes: StreamFrame<MuxFrame>[]
   waitForQuestion(): Promise<RpcRequest<Extract<MuxFrame, { type: 'question/requested' }>>>
 } {
-  const envelopes: RpcRequest<MuxFrame>[] = []
+  const envelopes: StreamFrame<MuxFrame>[] = []
   let resolveQuestion!: (value: RpcRequest<Extract<MuxFrame, { type: 'question/requested' }>>) => void
   const question = new Promise<RpcRequest<Extract<MuxFrame, { type: 'question/requested' }>>>((resolve) => {
     resolveQuestion = resolve
@@ -37,8 +37,8 @@ function openMux(api: ApiProxy, abort: AbortController): {
   void (async () => {
     for await (const envelope of api.events.mux({ rpcId: RpcId('question-mux'), payload: {} }, abort.signal)) {
       envelopes.push(envelope)
-      if (envelope.payload.type === 'question/requested') {
-        resolveQuestion(envelope as RpcRequest<Extract<MuxFrame, { type: 'question/requested' }>>)
+      if (envelope.request.payload.type === 'question/requested') {
+        resolveQuestion(envelope.request as RpcRequest<Extract<MuxFrame, { type: 'question/requested' }>>)
       }
     }
   })()
@@ -90,7 +90,7 @@ describe('question response validation', () => {
     await expect(asked).resolves.toEqual({
       answers: [{ id: 'targets', selected: ['Code', 'Docs'], custom: 'Release notes' }],
     })
-    expect(mux.envelopes.some(item => item.payload.type === 'question/resolved')).toBe(true)
+    expect(mux.envelopes.some(item => item.request.payload.type === 'question/resolved')).toBe(true)
     abort.abort()
   })
 

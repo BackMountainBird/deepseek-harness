@@ -33,11 +33,11 @@ import type { CommandDescriptor, CommandExecution, CommandResult } from '@deepse
 import { deriveEventMessage, foldSurface } from '@deepseek-ai/dsh-session/surface'
 import type {
   ApiProxy, ClientRequest, ClientResponse, HistoryEntry, HostFrame, MuxFrame, RpcReceipt,
-  ModelProviderGroup, ModelSelection, RpcRequest, RpcResponse, RpcResult, ServerRequest, ServerResponse, SessionSummary,
-  ToolCallView, ToolEventView, ToolResultView, WorkspaceId, WorkspaceView,
+  ModelProviderGroup, ModelSelection, RpcRequest, RpcResponse, RpcResult, ServerResponse, SessionSummary,
+  StreamFrame, ToolCallView, ToolEventView, ToolResultView, WorkspaceId, WorkspaceView,
 } from './api.ts'
 import type { RequestPayload, ResponseValue, RpcMethodMap } from '@deepseek-ai/dsh-host-apiproxy/api'
-import { AbstractApiClient, RpcId, SESSION_SEARCH_RESULT_LIMIT } from './api.ts'
+import { AbstractApiClient, RpcId, SESSION_SEARCH_RESULT_LIMIT, serializeStreamFrame, serverRequestSchema } from './api.ts'
 import { randomUuid } from './random-uuid.ts'
 import type { ClientConnectionRpc } from '../rpc.ts'
 
@@ -1438,6 +1438,15 @@ export interface FixtureOptions {
   dropSessionCreateResponse?: boolean
   /** Order of the two successful create frames. */
   createFrameOrder?: 'session-first' | 'workspace-first'
+}
+
+
+/**
+ * Pair one fixture envelope with its wire bytes, mirroring the host's shared
+ * serialize-once broadcast contract.
+ */
+function wireFrame<F extends MuxFrame | HostFrame>(envelope: RpcRequest<F>): StreamFrame<F> {
+  return { request: envelope, wire: serializeStreamFrame(envelope) }
 }
 
 /** Inbox pump shared by both stream generators (FrameQueue pattern: ONE abort listener hung
@@ -2865,7 +2874,7 @@ function createFixtureWorld(options: FixtureOptions): FixtureWorld {
           })
         }
         try {
-          yield* conn.drain(signal)
+          for await (const envelope of conn.drain(signal)) yield wireFrame(envelope)
         } finally {
           streamBreakers.delete(breakNow)
           muxConns.delete(conn)
@@ -2884,7 +2893,7 @@ function createFixtureWorld(options: FixtureOptions): FixtureWorld {
           if (gamma !== undefined) setRunning(gamma.sessionId, !gamma.running)
         }, 5000)
         try {
-          yield* conn.drain(signal)
+          for await (const envelope of conn.drain(signal)) yield wireFrame(envelope)
         } finally {
           clearInterval(timer)
           streamBreakers.delete(breakNow)
@@ -3149,16 +3158,18 @@ export class FixtureApiClient extends AbstractApiClient {
   }
 
   private async *tapStream<F extends MuxFrame | HostFrame>(
-    stream: AsyncIterable<RpcRequest<F>>,
+    stream: AsyncIterable<StreamFrame<F>>,
     onOpen?: () => void,
   ): AsyncGenerator<RpcRequest<F>> {
     // No HTTP here: the in-memory stream is established the moment iteration starts (mirrors
     // readSse firing onOpen after response headers, before any frame).
     onOpen?.()
-    for await (const envelope of stream) {
-      const full: ServerRequest = { type: 'server-request', rpcId: envelope.rpcId, method: envelope.payload.type, payload: envelope.payload }
-      this.onEnvelope(full)
-      yield envelope
+    for await (const frame of stream) {
+      // Parsing the wire bytes (not the envelope object) mirrors the real
+      // browser path and keeps the fixture honest about every frame's
+      // serialized form being a valid server request.
+      this.onEnvelope(serverRequestSchema.parse(JSON.parse(frame.wire)))
+      yield frame.request
     }
   }
 

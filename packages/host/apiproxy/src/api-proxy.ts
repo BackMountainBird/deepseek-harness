@@ -38,9 +38,10 @@ import type {
   ApiProxy, ConfigurableProviderView, CredentialView, GoalRef, HistoryEntry, HostFrame,
   ModelCatalogFailure, ModelProviderGroup,
   ModelReasoning, MuxFrame, PromptContentPart, QuestionResponsePayload, SessionListMetadata, SessionProjectionsBlock, SessionSearchItem,
-  QueuedInboxItem, SessionSummary, SettingsNamespaceView, SubagentAddress, JobView, ToolEventView,
+  QueuedInboxItem, SessionSummary, SettingsNamespaceView, StreamFrame, SubagentAddress, JobView, ToolEventView,
   WorkspaceId, WorkspaceView,
 } from './api/index.ts'
+import { serializeStreamFrame } from './api/index.ts'
 import {
   DEFAULT_SESSION_LOG_COMPRESSION_LEVEL,
   flushLiveSessionLog,
@@ -423,6 +424,15 @@ function frame<F>(payload: F): RpcRequest<F> {
 }
 
 /**
+ * Pair one minted frame with its wire bytes. The serialized form is computed
+ * exactly once here, so a frame broadcast to every consumer costs one
+ * serialization regardless of connection count.
+ */
+function streamFrame<F extends MuxFrame | HostFrame>(request: RpcRequest<F>): StreamFrame<F> {
+  return { request, wire: serializeStreamFrame(request) }
+}
+
+/**
  * Narrow one allowlisted host event's argument list to the JSON values the
  * wrapper frame carries. A rejected argument is an allowlist mistake (the
  * forwarded path applies no projection), not hostile input, so it throws rather
@@ -446,8 +456,8 @@ export function assertJsonArgs(event: string, args: readonly unknown[]): JsonVal
 }
 
 /** Queue the subscription baseline frame. */
-function subscribeSession(queue: FrameQueue<RpcRequest<MuxFrame>>, session: Session): void {
-  queue.push(frame({ type: 'session/subscribed', sessionId: session.id, lastSeq: session.seq - 1 }))
+function subscribeSession(queue: FrameQueue<StreamFrame<MuxFrame>>, session: Session): void {
+  queue.push(streamFrame(frame({ type: 'session/subscribed', sessionId: session.id, lastSeq: session.seq - 1 })))
 }
 
 /**
@@ -1098,7 +1108,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
   let workspaceCreationChain = Promise.resolve()
   const pendingQuestions = new Map<RpcId, PendingQuestion>()
   const pendingApprovals = new Map<RpcId, PendingApproval>()
-  const muxQueues = new Set<FrameQueue<RpcRequest<MuxFrame>>>()
+  const muxQueues = new Set<FrameQueue<StreamFrame<MuxFrame>>>()
   const imageAdmissionChains = new WeakMap<Agent, Promise<void>>()
 
   /** Serialize image admission with model selection for one agent. */
@@ -1239,10 +1249,98 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
       (await composeAgent(resolveSessionPreset({ header: meta, events }))).setup,
   })
 
-  /** Send one transient frame to every connected mux consumer. */
+  /**
+   * Send one transient frame to every connected mux consumer. The frame is
+   * minted and serialized exactly once; every consumer's carrier sends the
+   * same wire bytes, so per-consumer cost is one socket write.
+   */
   function broadcast(payload: MuxFrame): void {
-    const envelope = frame(payload)
-    for (const queue of muxQueues) queue.push(envelope)
+    const item = streamFrame(frame(payload))
+    for (const queue of muxQueues) queue.push(item)
+  }
+
+  // Per-session open-call table for result-view pairing, shared by every mux
+  // consumer: the pairing is a property of the session's event stream, not of
+  // any one connection. Bounded by the per-turn call count: entries clear on
+  // turn/end; a table miss (stream opened mid-turn) backscans the session's
+  // in-memory events instead.
+  const openCalls = new Map<SessionId, Map<string, { name: string; args: unknown }>>()
+
+  // Shared mux fanout: the session/event, session/created, session/disposed,
+  // and jobs listeners are registered once on the first stream open rather
+  // than once per open stream. Registration stays lazy so a proxy with no
+  // consumer pays zero per-event cost; after the last consumer leaves, the
+  // listeners no-op on the queue count before any frame mint, presenter work,
+  // or serialization. Every consumer sees the identical broadcast item.
+  let muxFanoutRegistered = false
+  const registerMuxFanout = (): void => {
+    if (muxFanoutRegistered) return
+    muxFanoutRegistered = true
+    ctx.on('session/event', (session: Session, event: SessionEvent) => {
+      if (event.type === 'tool/call') {
+        const data = event.data as ToolCallData
+        try {
+          let table = openCalls.get(session.id)
+          if (table === undefined) openCalls.set(session.id, table = new Map<string, { name: string; args: unknown }>())
+          table.set(data.callId, { name: data.name, args: JSON.parse(data.arguments) })
+        } catch {
+          // Unparseable model arguments: leave the table unset; the result view soft-falls.
+        }
+      } else if (event.type === 'turn/end') {
+        openCalls.delete(session.id)
+      }
+      if (muxQueues.size === 0) return
+      const view = viewFor(
+        ctx, event,
+        callId => openCalls.get(session.id)?.get(callId) ?? backscanArgs(session.events, callId),
+        ctx.agents.get(session.id),
+      )
+      broadcast({ type: 'session/event', sessionId: session.id, event, ...view === undefined ? {} : { view } })
+    })
+    ctx.on('session/created', (session: Session) => {
+      if (muxQueues.size === 0) return
+      broadcast({ type: 'session/subscribed', sessionId: session.id, lastSeq: session.seq - 1 })
+      // The subscribe frame clears the client's task mirror, and a session born
+      // after a stream opened missed the baseline loop. Unowned tasks are
+      // visible to it from birth, so without this it would show none until the
+      // next registry change.
+      const jobs = ctx.get('jobs')
+      const views = jobs === undefined ? [] : jobViews(jobs.list(ctx.agents.get(session.id)))
+      if (views.length > 0) {
+        broadcast({ type: 'session/jobs', sessionId: session.id, jobs: views })
+      }
+    })
+    ctx.on('session/disposed', (session: Session) => {
+      openCalls.delete(session.id)
+    })
+    // Shared jobs fanout. Every push is a complete snapshot, so an emptied set
+    // still sends `[]` — that transition is the one absence cannot express.
+    // Registration is synchronous here (an `ctx.inject` child activates
+    // asynchronously and would miss registry changes that follow in the same
+    // tick); a jobs registry composed after this point is picked up at the
+    // next stream open.
+    const jobs = ctx.get('jobs')
+    if (jobs !== undefined) {
+      ctx.effect(() => jobs.onJobsChanged((owner) => {
+        if (muxQueues.size === 0) return
+        if (owner !== undefined) {
+          // The exact owner instance the fence compares against, so the push
+          // stays correct even while that Agent's scope is tearing down and a
+          // lookup by id would already miss.
+          broadcast({ type: 'session/jobs', sessionId: owner.id, jobs: jobViews(jobs.list(owner)) })
+          return
+        }
+        // An unowned task is visible to every caller, so every subscribed
+        // session's set changed with it.
+        for (const session of ctx.sessions.list()) {
+          broadcast({
+            type: 'session/jobs',
+            sessionId: session.id,
+            jobs: jobViews(jobs.list(ctx.agents.get(session.id))),
+          })
+        }
+      }), 'api-proxy: mux jobs fanout')
+    }
   }
 
   // Projection change feed → session/projection push frames. The carrier
@@ -1356,11 +1454,11 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
         pending.onAbort = onAbort
         pendingQuestions.set(rpcId, pending)
         request.signal?.addEventListener('abort', onAbort, { once: true })
-        const envelope: RpcRequest<MuxFrame> = {
+        const item = streamFrame({
           rpcId,
           payload: { type: 'question/requested', sessionId, questions: request.questions },
-        }
-        for (const queue of muxQueues) queue.push(envelope)
+        })
+        for (const queue of muxQueues) queue.push(item)
       })
     },
   })
@@ -1451,8 +1549,8 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
         }
         pendingApprovals.set(pending.rpcId, pending)
         req.signal?.addEventListener('abort', onAbort, { once: true })
-        const envelope = requestedFrame(pending)
-        for (const queue of muxQueues) queue.push(envelope)
+        const item = streamFrame(requestedFrame(pending))
+        for (const queue of muxQueues) queue.push(item)
       })
     })
   }
@@ -3365,30 +3463,31 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
 
     events: {
       mux(_request, signal) {
-        const queue = new FrameQueue<RpcRequest<MuxFrame>>()
+        const queue = new FrameQueue<StreamFrame<MuxFrame>>()
         muxQueues.add(queue)
+        registerMuxFanout()
         for (const session of ctx.sessions.list()) {
           subscribeSession(queue, session)
         }
         for (const pending of pendingQuestions.values()) {
-          queue.push({
+          queue.push(streamFrame({
             rpcId: pending.rpcId,
             payload: {
               type: 'question/requested', sessionId: pending.sessionId,
               questions: pending.questions,
             },
-          })
+          }))
         }
         // Refresh recovery: still-pending approval questions replay with their
         // stable rpcId so a reconnecting client can still answer them.
-        for (const pending of pendingApprovals.values()) queue.push(requestedFrame(pending))
+        for (const pending of pendingApprovals.values()) queue.push(streamFrame(requestedFrame(pending)))
         // Queue snapshot baseline (pendingQuestions precedent): frames replayed
         // in arrival order per session; a reconnecting client rebuilds its
         // queue view from these alone.
         for (const session of ctx.sessions.list()) {
           const agent = ctx.agents.get(session.id)
           if (agent?.session === session && agent.inbox.hasPending) {
-            queue.push(frame({ type: 'session/queue', sessionId: session.id, items: queueItems(agent) }))
+            queue.push(streamFrame(frame({ type: 'session/queue', sessionId: session.id, items: queueItems(agent) })))
           }
         }
         // Background-task baseline. `ctx.agents.get` is the non-resuming read:
@@ -3400,76 +3499,19 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
           for (const session of ctx.sessions.list()) {
             const views = jobViews(jobs.list(ctx.agents.get(session.id)))
             if (views.length > 0) {
-              queue.push(frame({ type: 'session/jobs', sessionId: session.id, jobs: views }))
+              queue.push(streamFrame(frame({ type: 'session/jobs', sessionId: session.id, jobs: views })))
             }
           }
         }
-        // Per-session open-call table for result-view pairing. Bounded by the
-        // per-turn call count: entries clear on turn/end; a table miss (stream
-        // opened mid-turn) backscans the session's in-memory events instead.
-        const openCalls = new Map<SessionId, Map<string, { name: string; args: unknown }>>()
-        const disposers = [
-          ctx.on('session/event', (session: Session, event: SessionEvent) => {
-            if (event.type === 'tool/call') {
-              const data = event.data as ToolCallData
-              try {
-                let table = openCalls.get(session.id)
-                if (table === undefined) openCalls.set(session.id, table = new Map<string, { name: string; args: unknown }>())
-                table.set(data.callId, { name: data.name, args: JSON.parse(data.arguments) })
-              } catch {
-                // Unparseable model arguments: leave the table unset; the result view soft-falls.
-              }
-            } else if (event.type === 'turn/end') {
-              openCalls.delete(session.id)
-            }
-            const view = viewFor(
-              ctx, event,
-              callId => openCalls.get(session.id)?.get(callId) ?? backscanArgs(session.events, callId),
-              ctx.agents.get(session.id),
-            )
-            queue.push(frame({ type: 'session/event', sessionId: session.id, event, ...view === undefined ? {} : { view } }))
-          }),
-          ctx.on('session/created', (session: Session) => {
-            subscribeSession(queue, session)
-            // The subscribe frame clears the client's task mirror, and a
-            // session born after the stream opened missed the baseline loop.
-            // Unowned tasks are visible to it from birth, so without this it
-            // would show none until the next registry change.
-            const views = jobs === undefined ? [] : jobViews(jobs.list(ctx.agents.get(session.id)))
-            if (views.length > 0) {
-              queue.push(frame({ type: 'session/jobs', sessionId: session.id, jobs: views }))
-            }
-          }),
-          ctx.on('session/disposed', (session: Session) => {
-            openCalls.delete(session.id)
-          }),
-          ...jobs === undefined ? [] : [jobs.onJobsChanged((owner) => {
-            if (owner !== undefined) {
-              // The exact owner instance the fence compares against, so the
-              // push stays correct even while that Agent's scope is tearing
-              // down and a lookup by id would already miss.
-              queue.push(frame({ type: 'session/jobs', sessionId: owner.id, jobs: jobViews(jobs.list(owner)) }))
-              return
-            }
-            // An unowned task is visible to every caller, so every subscribed
-            // session's set changed with it.
-            for (const session of ctx.sessions.list()) {
-              queue.push(frame({
-                type: 'session/jobs',
-                sessionId: session.id,
-                jobs: jobViews(jobs.list(ctx.agents.get(session.id))),
-              }))
-            }
-          })],
-        ]
+        // Live event fanout is the proxy-level shared listener above; this
+        // queue is only its per-connection delivery target.
         return queue.iterate(signal, () => {
           muxQueues.delete(queue)
-          for (const dispose of disposers) dispose()
         })
       },
 
       host(_request, signal) {
-        const queue = new FrameQueue<RpcRequest<HostFrame>>()
+        const queue = new FrameQueue<StreamFrame<HostFrame>>()
         const committedWorkspaces = ctx.workspaceRegistry.list()
         const committedWorkspaceIds = new Set(
           committedWorkspaces.map(workspace => String(workspace.id)),
@@ -3481,7 +3523,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
         let archivedSessionIds = ctx.workspaceRegistry.archivedSessionIds
         const disposers = [
           ctx.on('session/created', (session: Session) => {
-            queue.push(frame({
+            queue.push(streamFrame(frame({
               type: 'host/session-added',
               sessionId: session.id,
               // Derived at frame time like summarize(); a just-created session
@@ -3489,16 +3531,16 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
               blank: sessionBlank(session),
               // Including cwd lets the client group the new session without refreshing the list.
               ...sessionListFields(session.header, session.events),
-            }))
+            })))
           }),
           ctx.on('session/disposed', (session: Session) => {
-            queue.push(frame({ type: 'host/session-removed', sessionId: session.id }))
+            queue.push(streamFrame(frame({ type: 'host/session-removed', sessionId: session.id })))
           }),
           ctx.on('agent/status', ({ agent, status }: { agent: Agent; status: AgentStatus }) => {
-            queue.push(frame({ type: 'host/session-status', sessionId: agent.id, running: status === 'running' }))
+            queue.push(streamFrame(frame({ type: 'host/session-status', sessionId: agent.id, running: status === 'running' })))
           }),
           ctx.on('agent/error', ({ agent, error }: { agent: Agent; error: unknown }) => {
-            queue.push(frame({ type: 'host/agent-error', sessionId: agent.id, message: errorChain(error) }))
+            queue.push(streamFrame(frame({ type: 'host/agent-error', sessionId: agent.id, message: errorChain(error) })))
           }),
           ctx.on('domain/changed', (change) => {
             if (change.domain !== 'workspace') return
@@ -3515,41 +3557,41 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
                   throw new Error(`committed workspace registry references missing workspace "${workspaceId}"`)
                 }
                 committedWorkspaceIds.add(workspaceId)
-                queue.push(frame({ type: 'host/workspace-changed', workspace: workspaceView(workspace) }))
+                queue.push(streamFrame(frame({ type: 'host/workspace-changed', workspace: workspaceView(workspace) })))
               }
               committedWorkspaceOrder = [...state.workspaceIds]
               if (orderChanged) {
-                queue.push(frame({
+                queue.push(streamFrame(frame({
                   type: 'host/workspace-order-changed',
                   workspaceIds: [...state.workspaceIds],
-                }))
+                })))
               }
               if (state.archivedSessionIds.length !== archivedSessionIds.length
                 || state.archivedSessionIds.some((id, index) => id !== archivedSessionIds[index])) {
                 archivedSessionIds = state.archivedSessionIds
-                queue.push(frame({
+                queue.push(streamFrame(frame({
                   type: 'host/archived-sessions-changed',
                   archivedSessionIds: [...state.archivedSessionIds],
-                }))
+                })))
               }
               return
             }
             if (change.table !== 'workspaces') return
             if (change.operation === 'deleted') {
               if (!committedWorkspaceIds.delete(change.key)) return
-              queue.push(frame({
+              queue.push(streamFrame(frame({
                 type: 'host/workspace-removed',
                 workspaceId: change.key as WorkspaceId,
-              }))
+              })))
               return
             }
             if (!committedWorkspaceIds.has(change.key)) return
             // Existing-entity table writes are complete attach/touch commits.
             // A new entity's first put waits for the global registry write above.
-            queue.push(frame({
+            queue.push(streamFrame(frame({
               type: 'host/workspace-changed',
               workspace: changedWorkspaceView(change.key, change.value),
-            }))
+            })))
           }),
           // Allowlisted host events ride one verbatim wrapper frame each. The
           // allowlist is api-remotes', and `ctx.remote.$on` is the consumer
@@ -3561,11 +3603,11 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
             // satisfies every member of the union `on` accepts here;
             // assertJsonArgs proves the payload is JSON-safe before it queues.
             ((...args: unknown[]) => {
-              queue.push(frame({
+              queue.push(streamFrame(frame({
                 type: 'host/remote-event',
                 event: name,
                 args: assertJsonArgs(name, args),
-              }))
+              })))
             }),
           )),
         ]

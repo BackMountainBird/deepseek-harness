@@ -4,14 +4,14 @@ import type { AddressInfo } from 'node:net'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
 import type {
-  ApiProxy, HostFrame, MuxFrame, RpcRequest, ServerRequest,
+  ApiProxy, HostFrame, MuxFrame, RpcRequest, ServerRequest, StreamFrame,
 } from '@deepseek-ai/dsh-host-apiproxy/api'
-import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api'
+import { RpcId, serializeStreamFrame } from '@deepseek-ai/dsh-host-apiproxy/api'
 import { HOST_EVENTS_PATH, MUX_EVENTS_PATH } from '../src/api-path.ts'
 import { WebSocketDownlinks } from '../src/websocket-downlink.ts'
 
-type MuxSource = (signal: AbortSignal) => AsyncIterable<RpcRequest<MuxFrame>>
-type HostSource = (signal: AbortSignal) => AsyncIterable<RpcRequest<HostFrame>>
+type MuxSource = (signal: AbortSignal) => AsyncIterable<StreamFrame<MuxFrame>>
+type HostSource = (signal: AbortSignal) => AsyncIterable<StreamFrame<HostFrame>>
 
 const running: (() => Promise<void>)[] = []
 
@@ -26,8 +26,13 @@ function untilAbort(signal: AbortSignal): Promise<void> {
   })
 }
 
-async function * idle<F>(signal: AbortSignal): AsyncGenerator<RpcRequest<F>> {
+async function * idle<F extends MuxFrame | HostFrame>(signal: AbortSignal): AsyncGenerator<StreamFrame<F>> {
   await untilAbort(signal)
+}
+
+/** Wrap one fake envelope in the shared serialize-once stream item. */
+function wireItem<P extends MuxFrame | HostFrame>(request: RpcRequest<P>): StreamFrame<P> {
+  return { request, wire: serializeStreamFrame(request) }
 }
 
 function api(mux: MuxSource, host: HostSource): ApiProxy {
@@ -82,10 +87,10 @@ describe('WebSocket downlinks', () => {
     const downlinks = new WebSocketDownlinks(api(
       async function * (signal) {
         try {
-          yield {
+          yield wireItem({
             rpcId: RpcId('mux-1'),
             payload: { type: 'session/subscribed', sessionId: 'session-1' as never, lastSeq: 4 },
-          }
+          })
           await untilAbort(signal)
         } finally {
           muxAborted = true
@@ -93,7 +98,7 @@ describe('WebSocket downlinks', () => {
       },
       async function * (signal) {
         try {
-          yield { rpcId: RpcId('host-1'), payload: { type: 'host/remote-event', event: 'commands/change', args: [] } }
+          yield wireItem({ rpcId: RpcId('host-1'), payload: { type: 'host/remote-event', event: 'commands/change', args: [] } })
           await untilAbort(signal)
         } finally {
           hostAborted = true
@@ -208,10 +213,10 @@ describe('WebSocket downlinks', () => {
         sourceSignal = signal
         try {
           await gate
-          yield {
+          yield wireItem({
             rpcId: RpcId('late'),
             payload: { type: 'session/subscribed', sessionId: 'session-late' as never, lastSeq: 0 },
-          }
+          })
         } finally {
           finish()
         }
@@ -236,10 +241,10 @@ describe('WebSocket downlinks', () => {
     const downlinks = new WebSocketDownlinks(api(
       async function * () {
         await gate
-        yield {
+        yield wireItem({
           rpcId: RpcId('send-failure'),
           payload: { type: 'session/subscribed', sessionId: 'session-send' as never, lastSeq: 0 },
-        }
+        })
       },
       idle,
     ))

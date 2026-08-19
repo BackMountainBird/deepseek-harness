@@ -19,7 +19,7 @@ import type { Session } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import type { ProjectionDefinition } from '@deepseek-ai/dsh-session-projection'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
-import type { MuxFrame, RpcRequest } from '@deepseek-ai/dsh-host-apiproxy/api'
+import type { MuxFrame, RpcRequest, StreamFrame } from '@deepseek-ai/dsh-host-apiproxy/api'
 import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api/rpc'
 import { createApiProxy } from '@deepseek-ai/dsh-host-apiproxy'
 
@@ -114,7 +114,7 @@ describe('session.history projections block', () => {
     const frames: MuxFrame[] = []
     const drained = (async () => {
       for await (const envelope of stream) {
-        frames.push(envelope.payload)
+        frames.push(envelope.request.payload)
         if (frames.some(f => f.type === 'session/event')) abort.abort()
       }
     })().catch(() => {})
@@ -274,10 +274,10 @@ describe('session.list projections column', () => {
 
 describe('session/projection push frame', () => {
   /** Drain frames until `count` session/projection frames arrived. */
-  async function collect(iterable: AsyncIterable<RpcRequest<MuxFrame>>, count: number, abort: AbortController): Promise<MuxFrame[]> {
+  async function collect(iterable: AsyncIterable<StreamFrame<MuxFrame>>, count: number, abort: AbortController): Promise<MuxFrame[]> {
     const frames: MuxFrame[] = []
     for await (const envelope of iterable) {
-      frames.push(envelope.payload)
+      frames.push(envelope.request.payload)
       if (frames.filter(f => f.type === 'session/projection').length >= count) abort.abort()
     }
     return frames
@@ -333,7 +333,7 @@ describe('session/projection push frame', () => {
     const frames: MuxFrame[] = []
     const drained = (async () => {
       for await (const envelope of stream) {
-        frames.push(envelope.payload)
+        frames.push(envelope.request.payload)
         if (frames.filter(f => f.type === 'session/event').length >= 2) abort.abort()
       }
     })()

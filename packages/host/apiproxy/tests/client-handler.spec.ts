@@ -7,8 +7,8 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import type { ApiProxy, GoalRef, HostFrame, MuxFrame, RpcMessage, RpcRequest, RpcResponse } from '@deepseek-ai/dsh-host-apiproxy'
-import { InProcessApiClient, RpcId, toFetchHandler } from '@deepseek-ai/dsh-host-apiproxy'
+import type { ApiProxy, GoalRef, HostFrame, MuxFrame, RpcMessage, RpcRequest, RpcResponse, StreamFrame } from '@deepseek-ai/dsh-host-apiproxy'
+import { InProcessApiClient, RpcId, serializeStreamFrame, toFetchHandler } from '@deepseek-ai/dsh-host-apiproxy'
 
 const sid = (id: string): SessionId => id as SessionId
 
@@ -17,6 +17,11 @@ function ok<T>(request: RpcRequest<unknown>, value: T): Promise<RpcResponse<T>> 
 }
 
 /** Scripted impl: every method resolves an empty-ish OK unless a case overrides it. */
+/** Wrap one fake envelope in the shared serialize-once stream item. */
+function wireItem<P extends MuxFrame | HostFrame>(request: RpcRequest<P>): StreamFrame<P> {
+  return { request, wire: serializeStreamFrame(request) }
+}
+
 function scriptedApi(overrides: {
   sessions?: Partial<ApiProxy['sessions']>
   subagents?: Partial<ApiProxy['subagents']>
@@ -30,7 +35,7 @@ function scriptedApi(overrides: {
   llm?: Partial<ApiProxy['llm']>
   respond?: ApiProxy['respond']
 } = {}): ApiProxy {
-  async function *empty<F>(): AsyncGenerator<RpcRequest<F>> { /* no frames */ }
+  async function *empty<F>(): AsyncGenerator<StreamFrame<F>> { /* no frames */ }
   const err = <T>(r: RpcRequest<unknown>): Promise<RpcResponse<T>> =>
     Promise.resolve({ rpcId: r.rpcId, result: { ok: false, error: { code: 'internal' as const, message: 'stub', details: {} } } })
   return {
@@ -452,7 +457,7 @@ describe('SSE stream path', () => {
       events: {
         async *mux(request) {
           let n = 0
-          for (const frame of frames) yield { rpcId: RpcId(`push-${n++}-${request.rpcId}`), payload: frame }
+          for (const frame of frames) yield wireItem({ rpcId: RpcId(`push-${n++}-${request.rpcId}`), payload: frame })
         },
       },
     })
@@ -492,8 +497,8 @@ describe('SSE stream path', () => {
   it('emits a stream/error frame then closes when the impl throws mid-stream', async () => {
     const api = scriptedApi({
       events: {
-        async *host(request): AsyncGenerator<RpcRequest<HostFrame>> {
-          yield { rpcId: RpcId(`p-${request.rpcId}`), payload: { type: 'host/session-added', sessionId: sid('s1'), blank: true } }
+        async *host(request): AsyncGenerator<StreamFrame<HostFrame>> {
+          yield wireItem({ rpcId: RpcId(`p-${request.rpcId}`), payload: { type: 'host/session-added', sessionId: sid('s1'), blank: true } })
           throw new Error('impl died mid-stream')
         },
       },
@@ -540,8 +545,8 @@ describe('SSE stream path', () => {
   it('fires onOpen once headers are in, before the first frame, and not on transport failure', async () => {
     const api = scriptedApi({
       events: {
-        async *mux(request): AsyncGenerator<RpcRequest<MuxFrame>> {
-          yield { rpcId: RpcId(`p-${request.rpcId}`), payload: { type: 'session/subscribed', sessionId: sid('s1'), lastSeq: 0 } }
+        async *mux(request): AsyncGenerator<StreamFrame<MuxFrame>> {
+          yield wireItem({ rpcId: RpcId(`p-${request.rpcId}`), payload: { type: 'session/subscribed', sessionId: sid('s1'), lastSeq: 0 } })
         },
       },
     })
@@ -564,11 +569,11 @@ describe('SSE stream path', () => {
     let implSawAbort = false
     const api = scriptedApi({
       events: {
-        async *mux(_request, signal): AsyncGenerator<RpcRequest<MuxFrame>> {
+        async *mux(_request, signal): AsyncGenerator<StreamFrame<MuxFrame>> {
           try {
             let n = 0
             while (true) {
-              yield { rpcId: RpcId(`p${n}`), payload: { type: 'session/subscribed', sessionId: sid('s1'), lastSeq: n++ } }
+              yield wireItem({ rpcId: RpcId(`p${n}`), payload: { type: 'session/subscribed', sessionId: sid('s1'), lastSeq: n++ } })
               await new Promise(resolve => setTimeout(resolve, 5))
               if (signal.aborted) return
             }

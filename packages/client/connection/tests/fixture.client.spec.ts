@@ -7,7 +7,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { SessionId, WorkspaceId } from '../src/client/api.ts'
 import { RpcId } from '../src/client/api.ts'
-import type { HostFrame, MuxFrame, RpcMessage, RpcRequest } from '../src/client/api.ts'
+import type { HostFrame, MuxFrame, RpcMessage, RpcRequest, StreamFrame } from '../src/client/api.ts'
 import { FixtureApiClient, createFixtureApi } from '../src/client/fixture.ts'
 
 const sid = (id: string): SessionId => id as SessionId
@@ -39,6 +39,18 @@ interface TimingHooks {
 const timing = (): TimingHooks => (globalThis as Record<string, unknown>).__fxTiming as TimingHooks
 
 /** Collect stream frames until the predicate or a soft cap; abort ends the stream. */
+async function collectWire<F>(stream: AsyncIterable<StreamFrame<F>>, abort: AbortController, done: (frames: F[]) => boolean): Promise<F[]> {
+  const frames: F[] = []
+  for await (const item of stream) {
+    frames.push(item.request.payload)
+    if (done(frames) || frames.length > 500) {
+      abort.abort()
+      break
+    }
+  }
+  return frames
+}
+
 async function collect<F>(stream: AsyncIterable<RpcRequest<F>>, abort: AbortController, done: (frames: F[]) => boolean): Promise<F[]> {
   const frames: F[] = []
   for await (const envelope of stream) {
@@ -265,7 +277,7 @@ describe('createFixtureApi', () => {
     const seen: HostFrame[] = []
     const consuming = (async () => {
       for await (const envelope of api.events.host(req({}), abort.signal)) {
-        seen.push(envelope.payload)
+        seen.push(envelope.request.payload)
         if (seen.length >= 1) abort.abort()
       }
     })()
@@ -295,8 +307,8 @@ describe('createFixtureApi', () => {
     const frames: MuxFrame[] = []
     const consuming = (async () => {
       for await (const envelope of api.events.mux(req({}), abort.signal)) {
-        frames.push(envelope.payload)
-        const last = envelope.payload
+        frames.push(envelope.request.payload)
+        const last = envelope.request.payload
         if (last.type === 'session/event' && last.event.type === 'turn/end') {
           abort.abort()
         }
@@ -346,7 +358,7 @@ describe('createFixtureApi', () => {
     if (!created.result.ok) throw new Error('create failed')
     const id = created.result.value.sessionId
     const abort = new AbortController()
-    const framesPromise = collect<MuxFrame>(api.events.mux(req({}), abort.signal), abort,
+    const framesPromise = collectWire<MuxFrame>(api.events.mux(req({}), abort.signal), abort,
       frames => frames.some(f => f.type === 'session/event' && f.event.type === 'turn/end'))
     await new Promise(resolve => setTimeout(resolve, 10))
     await api.sessions.prompt(req({ sessionId: id, mode: 'queue' as const, content: [{ type: 'text' as const, text: '短' }] }))
@@ -359,9 +371,9 @@ describe('createFixtureApi', () => {
 
   it('mux open replays subscribed sessions and resident interactions with stable rpcIds', async () => {
     const api = createFixtureApi()
-    const openOnce = async (): Promise<RpcRequest<MuxFrame>[]> => {
+    const openOnce = async (): Promise<StreamFrame<MuxFrame>[]> => {
       const abort = new AbortController()
-      const envelopes: RpcRequest<MuxFrame>[] = []
+      const envelopes: StreamFrame<MuxFrame>[] = []
       for await (const envelope of api.events.mux(req({}), abort.signal)) {
         envelopes.push(envelope)
         if (envelopes.length >= 13) abort.abort()
@@ -370,37 +382,37 @@ describe('createFixtureApi', () => {
     }
     const first = await openOnce()
     const second = await openOnce()
-    expect(first[0]?.payload).toMatchObject({ type: 'session/subscribed', sessionId: 'fx-alpha' })
-    expect((first[0]?.payload as { lastSeq: number }).lastSeq).toBeGreaterThan(0)
+    expect(first[0]?.request.payload).toMatchObject({ type: 'session/subscribed', sessionId: 'fx-alpha' })
+    expect((first[0]?.request.payload as { lastSeq: number }).lastSeq).toBeGreaterThan(0)
     // Projection baseline frames follow subscribed (domain units + token usage).
-    expect(first[1]?.payload).toMatchObject({ type: 'session/projection', sessionId: 'fx-alpha', key: 'title', value: 'Fixture 历史会话' })
-    expect(first[2]?.payload).toMatchObject({ type: 'session/projection', sessionId: 'fx-alpha', key: 'todos' })
-    expect(first[3]?.payload).toMatchObject({ type: 'session/projection', sessionId: 'fx-alpha', key: 'permissions' })
-    expect(first[4]?.payload).toMatchObject({ type: 'session/projection', sessionId: 'fx-alpha', key: 'plan', value: { active: false, pending: false } })
-    expect(first[5]?.payload).toMatchObject({ type: 'session/projection', sessionId: 'fx-alpha', key: 'goal', value: null })
-    expect(first[6]?.payload).toMatchObject({ type: 'session/projection', sessionId: 'fx-alpha', key: 'tokenUsage' })
-    expect(first[7]?.payload).toMatchObject({ type: 'session/projection', sessionId: 'fx-alpha', key: 'contextPressure' })
-    expect(first[8]?.payload).toMatchObject({
+    expect(first[1]?.request.payload).toMatchObject({ type: 'session/projection', sessionId: 'fx-alpha', key: 'title', value: 'Fixture 历史会话' })
+    expect(first[2]?.request.payload).toMatchObject({ type: 'session/projection', sessionId: 'fx-alpha', key: 'todos' })
+    expect(first[3]?.request.payload).toMatchObject({ type: 'session/projection', sessionId: 'fx-alpha', key: 'permissions' })
+    expect(first[4]?.request.payload).toMatchObject({ type: 'session/projection', sessionId: 'fx-alpha', key: 'plan', value: { active: false, pending: false } })
+    expect(first[5]?.request.payload).toMatchObject({ type: 'session/projection', sessionId: 'fx-alpha', key: 'goal', value: null })
+    expect(first[6]?.request.payload).toMatchObject({ type: 'session/projection', sessionId: 'fx-alpha', key: 'tokenUsage' })
+    expect(first[7]?.request.payload).toMatchObject({ type: 'session/projection', sessionId: 'fx-alpha', key: 'contextPressure' })
+    expect(first[8]?.request.payload).toMatchObject({
       type: 'session/projection', sessionId: 'fx-alpha', key: 'contextBreakdown',
       value: { systemTokens: 0, toolsTokens: 0 },
     })
-    expect((first[8]?.payload as { value: { messageTokens: number } }).value.messageTokens).toBeGreaterThan(0)
-    expect(first[9]?.payload).toMatchObject({ type: 'session/projection', sessionId: 'fx-alpha', key: 'sessionStats' })
-    expect((first[9]?.payload as { value: { turns: number; steps: number } }).value.steps).toBeGreaterThan(0)
-    expect(first[10]?.payload).toMatchObject({
+    expect((first[8]?.request.payload as { value: { messageTokens: number } }).value.messageTokens).toBeGreaterThan(0)
+    expect(first[9]?.request.payload).toMatchObject({ type: 'session/projection', sessionId: 'fx-alpha', key: 'sessionStats' })
+    expect((first[9]?.request.payload as { value: { turns: number; steps: number } }).value.steps).toBeGreaterThan(0)
+    expect(first[10]?.request.payload).toMatchObject({
       type: 'session/projection', sessionId: 'fx-alpha', key: 'imageLimits',
       value: { maxImagesPerMessage: 20, maxImageBytes: 5 * 1024 * 1024 },
     })
-    expect(first[11]?.payload).toMatchObject({ type: 'approval/requested', toolName: 'dangerous_tool' })
-    expect(second[11]?.rpcId).toBe(first[11]?.rpcId) // stable rpcId across replays (host replay semantics)
-    expect(first[12]?.payload).toMatchObject({ type: 'question/requested', sessionId: 'fx-alpha' })
-    expect(second[12]?.rpcId).toBe(first[12]?.rpcId)
+    expect(first[11]?.request.payload).toMatchObject({ type: 'approval/requested', toolName: 'dangerous_tool' })
+    expect(second[11]?.request.rpcId).toBe(first[11]?.request.rpcId) // stable rpcId across replays (host replay semantics)
+    expect(first[12]?.request.payload).toMatchObject({ type: 'question/requested', sessionId: 'fx-alpha' })
+    expect(second[12]?.request.rpcId).toBe(first[12]?.request.rpcId)
   })
 
   it('steer with no replay in flight falls through to a fresh queued turn; non-text blocks stringify empty', async () => {
     const api = createFixtureApi()
     const abort = new AbortController()
-    const framesPromise = collect<MuxFrame>(api.events.mux(req({}), abort.signal), abort,
+    const framesPromise = collectWire<MuxFrame>(api.events.mux(req({}), abort.signal), abort,
       frames => frames.some(f => f.type === 'session/event' && f.event.type === 'turn/end'))
     await new Promise(resolve => setTimeout(resolve, 10))
     const created = await api.sessions.create(req({}))
@@ -422,7 +434,7 @@ describe('createFixtureApi', () => {
       const abort = new AbortController()
       const hostSeen: HostFrame[] = []
       const consuming = (async () => {
-        for await (const envelope of api.events.host(req({}), abort.signal)) hostSeen.push(envelope.payload)
+        for await (const envelope of api.events.host(req({}), abort.signal)) hostSeen.push(envelope.request.payload)
       })()
       await vi.advanceTimersByTimeAsync(5001) // interval fires: fx-gamma flips running=true (no log exists)
       expect(hostSeen).toContainEqual({ type: 'host/session-status', sessionId: sid('fx-gamma'), running: true })
@@ -431,7 +443,7 @@ describe('createFixtureApi', () => {
       const baseline: MuxFrame[] = []
       const muxConsuming = (async () => {
         for await (const envelope of api.events.mux(req({}), mabort.signal)) {
-          baseline.push(envelope.payload)
+          baseline.push(envelope.request.payload)
           if (baseline.length >= 3) mabort.abort()
         }
       })()
@@ -453,8 +465,8 @@ describe('createFixtureApi', () => {
     const abort = new AbortController()
     let question: RpcRequest<MuxFrame> | undefined
     for await (const envelope of api.events.mux(req({}), abort.signal)) {
-      if (envelope.payload.type !== 'question/requested') continue
-      question = envelope
+      if (envelope.request.payload.type !== 'question/requested') continue
+      question = envelope.request
       abort.abort()
     }
     if (question === undefined) throw new Error('fixture question missing')
@@ -463,15 +475,15 @@ describe('createFixtureApi', () => {
     expect(await api.respond(response)).toEqual({ accepted: false, reason: 'not-pending' })
 
     const replayAbort = new AbortController()
-    const replayed = await collect(api.events.mux(req({}), replayAbort.signal), replayAbort, frames => frames.length === 2)
+    const replayed = await collectWire(api.events.mux(req({}), replayAbort.signal), replayAbort, frames => frames.length === 2)
     expect(replayed.every(frame => frame.type !== 'question/requested')).toBe(true)
 
     const cancelledApi = createFixtureApi()
     const cancelAbort = new AbortController()
     let cancelQuestion: RpcRequest<MuxFrame> | undefined
     for await (const envelope of cancelledApi.events.mux(req({}), cancelAbort.signal)) {
-      if (envelope.payload.type !== 'question/requested') continue
-      cancelQuestion = envelope
+      if (envelope.request.payload.type !== 'question/requested') continue
+      cancelQuestion = envelope.request
       cancelAbort.abort()
     }
     if (cancelQuestion === undefined) throw new Error('fixture cancellation question missing')
@@ -487,7 +499,9 @@ describe('createFixtureApi', () => {
     const abort = new AbortController()
     const seen: { rpcId: string; frame: MuxFrame }[] = []
     const consuming = (async () => {
-      for await (const envelope of api.events.mux(req({}), abort.signal)) seen.push({ rpcId: envelope.rpcId, frame: envelope.payload })
+      for await (const envelope of api.events.mux(req({}), abort.signal)) {
+        seen.push({ rpcId: envelope.request.rpcId, frame: envelope.request.payload })
+      }
     })()
     await vi.waitFor(() => {
       expect(seen.some(s => s.frame.type === 'approval/requested')).toBe(true)
@@ -515,7 +529,7 @@ describe('createFixtureApi', () => {
     abort.abort()
     await consuming
     const abort2 = new AbortController()
-    const replayed = await collect(api.events.mux(req({}), abort2.signal), abort2, frames => frames.length === 2)
+    const replayed = await collectWire(api.events.mux(req({}), abort2.signal), abort2, frames => frames.length === 2)
     expect(replayed.some(f => f.type === 'approval/requested')).toBe(false)
   })
 
@@ -563,7 +577,7 @@ describe('createFixtureApi', () => {
     const seen: HostFrame[] = []
     const consuming = (async () => {
       for await (const envelope of api.events.host(req({}), abort.signal)) {
-        seen.push(envelope.payload)
+        seen.push(envelope.request.payload)
         abort.abort()
       }
     })()
@@ -588,7 +602,7 @@ describe('createFixtureApi', () => {
     const seen: HostFrame[] = []
     const consuming = (async () => {
       for await (const envelope of api.events.host(req({}), abort.signal)) {
-        seen.push(envelope.payload)
+        seen.push(envelope.request.payload)
         if (seen.length >= 2) abort.abort()
       }
     })()
@@ -619,7 +633,7 @@ describe('createFixtureApi', () => {
     const framesPromise = (async () => {
       const frames: MuxFrame[] = []
       for await (const envelope of api.events.mux(req({}), abort.signal)) {
-        frames.push(envelope.payload)
+        frames.push(envelope.request.payload)
         if (frames.some(f => f.type === 'session/projection' && f.key === 'title' && f.value === '重命名')) abort.abort()
       }
       return frames
@@ -683,7 +697,7 @@ describe('createFixtureApi', () => {
     const seen: HostFrame[] = []
     const consuming = (async () => {
       for await (const envelope of api.events.host(req({}), abort.signal)) {
-        seen.push(envelope.payload)
+        seen.push(envelope.request.payload)
         abort.abort()
       }
     })()
@@ -708,7 +722,7 @@ describe('createFixtureApi', () => {
     const seen: HostFrame[] = []
     const consuming = (async () => {
       for await (const envelope of api.events.host(req({}), abort.signal)) {
-        seen.push(envelope.payload)
+        seen.push(envelope.request.payload)
         if (seen.length >= 2) abort.abort()
       }
     })()
@@ -742,7 +756,7 @@ describe('createFixtureApi', () => {
     const made = await api.workspace.create(req({ path: '/tmp/fixture-workspaces/nova' }))
     if (!made.result.ok) throw new Error('workspace create failed')
     const abort = new AbortController()
-    const framesPromise = collect(api.events.host(req({}), abort.signal), abort, frames => frames.length === 2)
+    const framesPromise = collectWire(api.events.host(req({}), abort.signal), abort, frames => frames.length === 2)
     await new Promise(resolve => setTimeout(resolve, 10))
     const preallocated = sid('fx-preallocated')
     const created = await api.sessions.create(req({
@@ -883,7 +897,7 @@ describe('createFixtureApi', () => {
     const abort = new AbortController()
     const seen: MuxFrame[] = []
     const consuming = (async () => {
-      for await (const envelope of api.events.mux(req({}), abort.signal)) seen.push(envelope.payload)
+      for await (const envelope of api.events.mux(req({}), abort.signal)) seen.push(envelope.request.payload)
     })()
     await new Promise(resolve => setTimeout(resolve, 10))
     hooks.appendSilent('fx-alpha', '静默丢帧')
@@ -935,7 +949,7 @@ describe('createFixtureApi', () => {
     expect(() => hooks.startReasoningChunkStorm('fx-alpha', 1, 1, 0)).toThrow(/reasoning interval/)
     const abort = new AbortController()
     try {
-      const streamed = collect(api.events.mux(req({}), abort.signal), abort, frames => frames.some(frame => (
+      const streamed = collectWire(api.events.mux(req({}), abort.signal), abort, frames => frames.some(frame => (
         frame.type === 'session/event'
         && frame.event.type === 'assistant/chunk'
         && frame.event.data.chunk.type === 'reasoning-delta'

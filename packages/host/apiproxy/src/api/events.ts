@@ -1,7 +1,8 @@
 /**
  * events domain contract: signatures and frame unions for the two logical
- * streams. Four-quadrant: streams yield the narrow form `RpcRequest<Frame>` (server-request
- * view) — rpcId must be exposed to the business layer, because responses to answerable frames
+ * streams. Four-quadrant: streams yield {@link StreamFrame} — the narrow form
+ * `RpcRequest<Frame>` (server-request view) plus its pre-serialized wire bytes —
+ * rpcId must be exposed to the business layer, because responses to answerable frames
  * (approval/question requested) echo it; for pure pushes it identifies that one push.
  * signal is a local stream-control parameter, independent of the request (never on the wire).
  */
@@ -43,6 +44,32 @@ export interface QueuedInboxItem {
   message: Message
 }
 
+/**
+ * One queued item on a mux/host stream: the frame plus its pre-serialized
+ * wire bytes. Broadcast frames serialize exactly once and every carrier sends
+ * the same string verbatim, so per-consumer cost is one socket write.
+ */
+export interface StreamFrame<F> {
+  /** The frame in its server-request view; rpcId stays exposed for answerable frames. */
+  readonly request: RpcRequest<F>
+  /** Wire bytes of the server-request envelope, shared verbatim by every carrier. */
+  readonly wire: string
+}
+
+/**
+ * Serialize one stream frame's server-request envelope to its wire bytes.
+ * @param request - the frame to serialize.
+ * @returns the JSON bytes a carrier transmits without further shaping.
+ */
+export function serializeStreamFrame(request: RpcRequest<MuxFrame | HostFrame>): string {
+  return JSON.stringify({
+    type: 'server-request',
+    rpcId: request.rpcId,
+    method: request.payload.type,
+    payload: request.payload,
+  })
+}
+
 /** Streaming face of the contract: the two logical stream openers (mux + host). */
 export interface EventsApi {
   /**
@@ -53,13 +80,13 @@ export interface EventsApi {
    * since: resume hook, unimplemented in v1 (ignored if passed); reconnection = reopen the
    * stream + refetch history.
    */
-  mux(request: RpcRequest<{ since?: Record<SessionId, number> }>, signal: AbortSignal): AsyncIterable<RpcRequest<MuxFrame>>
+  mux(request: RpcRequest<{ since?: Record<SessionId, number> }>, signal: AbortSignal): AsyncIterable<StreamFrame<MuxFrame>>
 
   /**
    * Host-level info stream: session create/destroy, running-status flips, and
    * agent failures with no turn position. Empty payload uses `{}`.
    */
-  host(request: RpcRequest<{}>, signal: AbortSignal): AsyncIterable<RpcRequest<HostFrame>>
+  host(request: RpcRequest<{}>, signal: AbortSignal): AsyncIterable<StreamFrame<HostFrame>>
 }
 
 /**
