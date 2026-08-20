@@ -37,6 +37,19 @@ export type { JsonlCompression } from './format.ts'
 const DEFAULT_PACK_CHUNKS = true
 const DEFAULT_COMPRESSION: JsonlCompression = 'zstd'
 /**
+ * Internal scheduling constant, not deployment configuration: session-dir
+ * probes during one listing run with bounded parallelism so a saturated event
+ * loop cannot serialize hundreds of awaited fs round-trips into a listing.
+ */
+const LIST_PROBE_CONCURRENCY = 16
+
+/** One memoized header line plus the file identity that vouches for it. */
+interface HeaderMemoEntry {
+  readonly dev: bigint
+  readonly ino: bigint
+  readonly first: string
+}
+/**
  * Internal scheduling constant, not deployment configuration: balance
  * frame-boundary event-loop yields against `setImmediate` overhead. One frame
  * remains an indivisible synchronous decode.
@@ -144,6 +157,15 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
   private compression: JsonlCompression
   private coordinator: PersistenceCoordinator<JsonlTornMarker>
   private rootEncodingCheck: Promise<void> | undefined
+  /**
+   * Header lines memoized per artifact path, valid while the stat identity
+   * (dev, ino) still matches. The first frame of an append-only log is
+   * immutable — appends and tail-truncating repairs never rewrite frame 0 —
+   * so a recreated file (new inode) is the only invalidation. Unbounded on
+   * purpose: one small line per stored session, bounded by the on-disk
+   * inventory the backend itself never prunes.
+   */
+  private readonly headerMemo = new Map<string, HeaderMemoEntry>()
 
   constructor(ctx: Context, public config: Config) {
     super(ctx)
@@ -473,39 +495,108 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
     signal?.throwIfAborted()
     await this.ensureRootEncoding()
     signal?.throwIfAborted()
-    const artifacts: Array<{ header: SessionHeader; path: string }> = []
-    const ids = new Set<SessionId>()
+    const dirs: string[] = []
     for (const project of await this.listProjectDirs(signal)) {
       signal?.throwIfAborted()
-      for (const dir of await this.listSessionDirs(project, signal)) {
-        signal?.throwIfAborted()
-        const opposite = join(dir, `session${logSuffix(this.oppositeCompression())}`)
-        const oppositeExists = await this.exists(opposite)
-        signal?.throwIfAborted()
-        if (oppositeExists) throw this.encodingMismatch(opposite)
-        const path = join(dir, `session${logSuffix(this.compression)}`)
-        const pathExists = await this.exists(path)
-        signal?.throwIfAborted()
-        if (!pathExists) continue
-        // Read only headers so listing scales with session count, not log size.
-        const first = this.compression === 'zstd'
-          ? await this.readFirstZstdLine(path, signal)
-          : await this.readFirstLine(path, signal)
-        signal?.throwIfAborted()
-        if (first === undefined) continue // empty/half-written file
-        const meta = parseHeaderMeta(first)
-        if (meta === undefined) continue // not a session header
-        await this.assertStoredIdentity(path, meta, undefined, signal)
-        signal?.throwIfAborted()
-        if (ids.has(meta.id)) {
-          throw new Error(`duplicate JSONL session id "${meta.id}" appears in multiple project directories`)
+      dirs.push(...await this.listSessionDirs(project, signal))
+    }
+    signal?.throwIfAborted()
+    // Probe session dirs with bounded parallelism; results land by dir index so
+    // the artifact order stays the deterministic directory order.
+    const probed = new Array<{ header: SessionHeader; path: string } | undefined>(dirs.length)
+    const queue = dirs.map((dir, index) => ({ dir, index }))
+    await Promise.all(Array.from(
+      { length: Math.min(LIST_PROBE_CONCURRENCY, queue.length) },
+      async () => {
+        for (let job = queue.shift(); job !== undefined; job = queue.shift()) {
+          signal?.throwIfAborted()
+          probed[job.index] = await this.probeSessionDir(job.dir, signal)
         }
-        ids.add(meta.id)
-        artifacts.push({ header: meta, path })
+      },
+    ))
+    signal?.throwIfAborted()
+    const artifacts: Array<{ header: SessionHeader; path: string }> = []
+    const ids = new Set<SessionId>()
+    for (const artifact of probed) {
+      signal?.throwIfAborted()
+      if (artifact === undefined) continue
+      if (ids.has(artifact.header.id)) {
+        throw new Error(`duplicate JSONL session id "${artifact.header.id}" appears in multiple project directories`)
       }
+      ids.add(artifact.header.id)
+      artifacts.push(artifact)
     }
     signal?.throwIfAborted()
     return artifacts
+  }
+
+  /**
+   * Resolve one session directory to its listed artifact, or undefined when it
+   * holds no readable header. Two stat probes replace the open probes and gate
+   * the header read behind the memo, so a warm listing costs no log read at
+   * all.
+   */
+  private async probeSessionDir(
+    dir: string,
+    signal?: AbortSignal,
+  ): Promise<{ header: SessionHeader; path: string } | undefined> {
+    signal?.throwIfAborted()
+    const opposite = join(dir, `session${logSuffix(this.oppositeCompression())}`)
+    const oppositeIdentity = await this.statArtifact(opposite)
+    signal?.throwIfAborted()
+    if (oppositeIdentity !== undefined) throw this.encodingMismatch(opposite)
+    const path = join(dir, `session${logSuffix(this.compression)}`)
+    const identity = await this.statArtifact(path)
+    signal?.throwIfAborted()
+    if (identity === undefined) return undefined
+    // Read only headers so listing scales with session count, not log size.
+    const first = await this.headerLine(path, identity, signal)
+    signal?.throwIfAborted()
+    if (first === undefined) return undefined // empty/half-written file
+    const meta = parseHeaderMeta(first)
+    if (meta === undefined) return undefined // not a session header
+    await this.assertStoredIdentity(path, meta, undefined, signal)
+    signal?.throwIfAborted()
+    return { header: meta, path }
+  }
+
+  /**
+   * Stat one artifact path for identity; an absent path yields undefined after
+   * the same absence guard {@link exists} applies, so a blocked session
+   * directory remains a storage fault rather than silent absence.
+   */
+  private async statArtifact(path: string): Promise<FileRevisionIdentity | undefined> {
+    try {
+      return await stat(path, { bigint: true })
+    } catch (error: unknown) {
+      /* v8 ignore else -- non-ENOENT stat failures require an external permission or I/O fault */
+      if (isENOENT(error)) {
+        await this.assertLogParentAllowsAbsence(path)
+        return undefined
+      }
+      /* v8 ignore next -- external permission or I/O fault, out of test control */
+      throw error
+    }
+  }
+
+  /**
+   * The first line of one artifact, served from the memo while the file
+   * identity matches. The header frame is immutable under append-only writes,
+   * so identity equality means the memoized line is exactly what a fresh read
+   * would return.
+   */
+  private async headerLine(
+    path: string,
+    identity: FileRevisionIdentity,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> {
+    const memo = this.headerMemo.get(path)
+    if (memo !== undefined && memo.dev === identity.dev && memo.ino === identity.ino) return memo.first
+    const first = this.compression === 'zstd'
+      ? await this.readFirstZstdLine(path, signal)
+      : await this.readFirstLine(path, signal)
+    if (first !== undefined) this.headerMemo.set(path, { dev: identity.dev, ino: identity.ino, first })
+    return first
   }
 
   // --- materialization / append / repair (file mechanics) ---

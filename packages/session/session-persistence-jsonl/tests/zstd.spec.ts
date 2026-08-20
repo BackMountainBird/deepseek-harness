@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { appendFile, mkdir, mkdtemp, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
@@ -510,7 +510,6 @@ describe('JsonlSessionPersistence: default Zstandard encoding', () => {
       const header = meta(`cancel-${compression}-header-read`, '/work')
       await ctx.sessionPersistence.create(header)
       await ctx.sessionPersistence.append(header.id, oneTurnLog())
-      await ctx.sessionPersistence.list()
       const path = logPath(root, header.cwd, header.id, compression)
       const probe = await open(path, 'r')
       const prototype = Object.getPrototypeOf(probe) as { read: HeaderRead }
@@ -534,6 +533,65 @@ describe('JsonlSessionPersistence: default Zstandard encoding', () => {
       expect(read).toHaveBeenCalledTimes(1)
     },
   )
+
+  it.each(['none', 'zstd'] as const)(
+    'a warm %s listing reuses the memoized header without reading the log',
+    async (compression) => {
+      const root = await freshRoot()
+      const ctx = await mount(root, compression)
+      const header = meta(`warm-${compression}-listing`, '/work')
+      await ctx.sessionPersistence.create(header)
+      await ctx.sessionPersistence.append(header.id, oneTurnLog())
+      expect((await ctx.sessionPersistence.list()).map(h => h.id)).toEqual([header.id])
+
+      const path = logPath(root, header.cwd, header.id, compression)
+      const probe = await open(path, 'r')
+      const prototype = Object.getPrototypeOf(probe) as { read: HeaderRead }
+      await probe.close()
+      const read = vi.spyOn(prototype, 'read')
+
+      const headers = await ctx.sessionPersistence.list()
+      expect(headers.map(h => h.id)).toEqual([header.id])
+      expect(read).not.toHaveBeenCalled()
+      read.mockRestore()
+    },
+  )
+
+  it('a recreated artifact at the same path invalidates the memo and lists the new header', async () => {
+    const root = await freshRoot()
+    const ctx = await mount(root)
+    const first = meta('recreated-artifact', '/work')
+    await ctx.sessionPersistence.create(first)
+    await ctx.sessionPersistence.append(first.id, oneTurnLog())
+    expect((await ctx.sessionPersistence.list()).map(h => h.createdAt)).toEqual([first.createdAt])
+
+    // Replace the file the way materialization publishes: a renamed-in new
+    // inode carrying a different header at the identical path.
+    const path = logPath(root, first.cwd, first.id, 'zstd')
+    const second = { ...first, createdAt: first.createdAt + 1 }
+    const staged = join(dirname(path), 'staged-replacement')
+    await writeFile(staged, await compressZstdFrame(`${JSON.stringify(toHeaderLine(second))}\n`))
+    await rename(staged, path)
+
+    expect((await ctx.sessionPersistence.list()).map(h => h.createdAt)).toEqual([second.createdAt])
+  })
+
+  it('surfaces non-ENOENT probe stat failures during listing', async () => {
+    const root = await freshRoot()
+    const ctx = await mount(root)
+    const header = meta('probe-stat-failure', '/work')
+    await ctx.sessionPersistence.create(header)
+    await ctx.sessionPersistence.append(header.id, oneTurnLog())
+    const persistence = ctx.sessionPersistence as unknown as {
+      statArtifact(path: string): Promise<unknown>
+    }
+    const failure = Object.assign(new Error('EACCES: permission denied, probe'), { code: 'EACCES' })
+    const statArtifact = vi.spyOn(persistence, 'statArtifact').mockRejectedValueOnce(failure)
+
+    await expect(ctx.sessionPersistence.list()).rejects.toBe(failure)
+    expect(statArtifact).toHaveBeenCalled()
+    statArtifact.mockRestore()
+  })
 
   it('preserves complete records from a torn frame and re-encodes them with crash closers', async () => {
     const root = await freshRoot()
@@ -691,7 +749,9 @@ describe('JsonlSessionPersistence: default Zstandard encoding', () => {
       .rejects.toThrow(/empty or header-less Zstandard session log/)
     await expect(ctx.sessionPersistence.load(SessionId('empty-header')))
       .rejects.toThrow(/first frame is not exactly one header line/)
-    await expect(ctx.sessionPersistence.list()).rejects.toThrow(/header frame failed validation/)
+    // Probing runs with bounded parallelism, so either corrupt frame may settle
+    // first; both reject the listing as a corrupt Zstandard log.
+    await expect(ctx.sessionPersistence.list()).rejects.toThrow(/corrupt Zstandard session log/)
   })
 })
 
