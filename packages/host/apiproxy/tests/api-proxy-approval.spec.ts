@@ -15,7 +15,7 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import ApprovalService from '@deepseek-ai/dsh-user-approval'
 import type { ApprovalRequestId } from '@deepseek-ai/dsh-user-approval'
-import type { ApiProxy, MuxFrame, RpcRequest } from '@deepseek-ai/dsh-host-apiproxy/api'
+import type { ApiProxy, MuxFrame, RpcRequest, StreamFrame } from '@deepseek-ai/dsh-host-apiproxy/api'
 import type { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api/rpc'
 import { RpcId as mintRpcId } from '@deepseek-ai/dsh-host-apiproxy/api/rpc'
 import { createApiProxy } from '../src/api-proxy.ts'
@@ -39,19 +39,19 @@ function agentOf(ctx: Context): Agent {
 }
 
 /** Open a mux stream and capture frames into an array (returns an on-demand waiter). */
-function openMux(api: ApiProxy, abort: AbortController): { frames: MuxFrame[]; envelopes: RpcRequest<MuxFrame>[]; waitFor(type: MuxFrame['type']): Promise<MuxFrame> } {
+function openMux(api: ApiProxy, abort: AbortController): { frames: MuxFrame[]; envelopes: StreamFrame<MuxFrame>[]; waitFor(type: MuxFrame['type']): Promise<MuxFrame> } {
   const frames: MuxFrame[] = []
-  const envelopes: RpcRequest<MuxFrame>[] = []
+  const envelopes: StreamFrame<MuxFrame>[] = []
   const waiters: { type: MuxFrame['type']; resolve: (frame: MuxFrame) => void }[] = []
   void (async () => {
     for await (const envelope of api.events.mux({ rpcId: mintRpcId('t-mux'), payload: {} }, abort.signal)) {
-      frames.push(envelope.payload)
+      frames.push(envelope.request.payload)
       envelopes.push(envelope)
       for (let i = waiters.length - 1; i >= 0; i -= 1) {
         const waiter = waiters[i] as (typeof waiters)[number]
-        if (waiter.type === envelope.payload.type) {
+        if (waiter.type === envelope.request.payload.type) {
           waiters.splice(i, 1)
-          waiter.resolve(envelope.payload)
+          waiter.resolve(envelope.request.payload)
         }
       }
     }
@@ -95,7 +95,7 @@ describe('approval pending registry', () => {
     const requested = requestedOf(await mux.waitFor('approval/requested'))
     expect(requested).toMatchObject({ toolName: 'bash', reason: 'sandbox escalation', sessionId: agent.session.id })
 
-    const envelope = mux.envelopes.find(e => e.payload.type === 'approval/requested') as RpcRequest<MuxFrame>
+    const envelope = mux.envelopes.find(e => e.request.payload.type === 'approval/requested')?.request as RpcRequest<MuxFrame>
     const receipt = await api.respond(answer(envelope.rpcId, requested.sessionId, requested.approvalId, 'allowed-once'))
     expect(receipt).toEqual({ accepted: true })
     await expect(asked).resolves.toBe('allowed-once')
@@ -116,14 +116,14 @@ describe('approval pending registry', () => {
     const agent = agentOf(ctx)
     const asked = ctx.approval.request({ agent, toolName: 'write' })
     const requested = requestedOf(await firstMux.waitFor('approval/requested'))
-    const firstEnvelope = firstMux.envelopes.find(e => e.payload.type === 'approval/requested') as RpcRequest<MuxFrame>
+    const firstEnvelope = firstMux.envelopes.find(e => e.request.payload.type === 'approval/requested')?.request as RpcRequest<MuxFrame>
     first.abort()
 
     // A fresh subscriber (refresh recovery) sees the same stable rpcId.
     const second = new AbortController()
     const secondMux = openMux(api, second)
     const replayed = requestedOf(await secondMux.waitFor('approval/requested'))
-    const secondEnvelope = secondMux.envelopes.find(e => e.payload.type === 'approval/requested') as RpcRequest<MuxFrame>
+    const secondEnvelope = secondMux.envelopes.find(e => e.request.payload.type === 'approval/requested')?.request as RpcRequest<MuxFrame>
     expect(secondEnvelope.rpcId).toBe(firstEnvelope.rpcId)
     expect(replayed.approvalId).toBe(requested.approvalId)
 
@@ -140,7 +140,7 @@ describe('approval pending registry', () => {
     const agent = agentOf(ctx)
     void ctx.approval.request({ agent, toolName: 'bash' })
     const requested = requestedOf(await mux.waitFor('approval/requested'))
-    const envelope = mux.envelopes.find(e => e.payload.type === 'approval/requested') as RpcRequest<MuxFrame>
+    const envelope = mux.envelopes.find(e => e.request.payload.type === 'approval/requested')?.request as RpcRequest<MuxFrame>
 
     // Unknown rpcId: not routed to any pending entry.
     expect(await api.respond(answer(mintRpcId('ghost'), requested.sessionId, requested.approvalId, 'rejected')))
@@ -165,7 +165,7 @@ describe('approval pending registry', () => {
     const cancel = new AbortController()
     const asked = ctx.approval.request({ agent, toolName: 'bash', signal: cancel.signal })
     const requested = requestedOf(await mux.waitFor('approval/requested'))
-    const envelope = mux.envelopes.find(e => e.payload.type === 'approval/requested') as RpcRequest<MuxFrame>
+    const envelope = mux.envelopes.find(e => e.request.payload.type === 'approval/requested')?.request as RpcRequest<MuxFrame>
 
     cancel.abort()
     await expect(asked).resolves.toBe('cancelled')
@@ -200,7 +200,7 @@ describe('approval pending registry', () => {
     const abort2 = new AbortController()
     const mux2 = openMux(api, abort2)
     await new Promise(resolve => setTimeout(resolve, 10))
-    expect(mux2.envelopes.some(e => e.payload.type === 'approval/requested')).toBe(false)
+    expect(mux2.envelopes.some(e => e.request.payload.type === 'approval/requested')).toBe(false)
     abort2.abort()
     abort.abort()
     void mux
@@ -240,7 +240,7 @@ describe('approval pending registry', () => {
     const asked = ctx.approval.request({ agent, toolName: 'bash', callId: 'call-9' as never, signal: cancel.signal })
     const requested = requestedOf(await mux.waitFor('approval/requested'))
     expect(requested.callId).toBe('call-9')
-    const envelope = mux.envelopes.find(e => e.payload.type === 'approval/requested') as RpcRequest<MuxFrame>
+    const envelope = mux.envelopes.find(e => e.request.payload.type === 'approval/requested')?.request as RpcRequest<MuxFrame>
     expect(await api.respond(answer(envelope.rpcId, requested.sessionId, requested.approvalId, 'allowed-once')))
       .toEqual({ accepted: true })
     await expect(asked).resolves.toBe('allowed-once')
@@ -260,7 +260,7 @@ describe('approval pending registry', () => {
     const askA = ctx.approval.request({ agent, toolName: 'bash', callId: 'call-a' as never })
     const askB = ctx.approval.request({ agent, toolName: 'bash', callId: 'call-b' as never })
     await waitForCount(mux, 'approval/requested', 2)
-    const frames = mux.envelopes.filter(e => e.payload.type === 'approval/requested')
+    const frames = mux.envelopes.filter(e => e.request.payload.type === 'approval/requested').map(e => e.request)
     const frameA = frames.find(e => requestedOf(e.payload).callId === 'call-a') as RpcRequest<MuxFrame>
     const frameB = frames.find(e => requestedOf(e.payload).callId === 'call-b') as RpcRequest<MuxFrame>
     // Each frame claimed the asked event with its own callId, not merely the newest.
@@ -287,7 +287,7 @@ describe('approval pending registry', () => {
     const askA = ctx.approval.request({ agent, toolName: 'alpha' })
     const askB = ctx.approval.request({ agent, toolName: 'beta' })
     await waitForCount(mux, 'approval/requested', 2)
-    const frames = mux.envelopes.filter(e => e.payload.type === 'approval/requested')
+    const frames = mux.envelopes.filter(e => e.request.payload.type === 'approval/requested').map(e => e.request)
     const frameA = frames.find(e => requestedOf(e.payload).toolName === 'alpha') as RpcRequest<MuxFrame>
     const frameB = frames.find(e => requestedOf(e.payload).toolName === 'beta') as RpcRequest<MuxFrame>
     // Without a callId the pairing is heuristic, but never shared: the second

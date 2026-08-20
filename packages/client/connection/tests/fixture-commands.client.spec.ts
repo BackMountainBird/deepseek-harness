@@ -52,7 +52,7 @@ describe('createFixtureApi commands/skills', () => {
     const stream = api.events.mux(req({}), abort.signal)
     const pump = (async () => {
       for await (const frame of stream) {
-        frames.push(frame.payload)
+        frames.push(frame.request.payload)
         if (frames.filter(f => (f as { type: string }).type === 'session/event').length >= 2) abort.abort()
       }
     })()
@@ -89,7 +89,7 @@ describe('createFixtureApi commands/skills', () => {
     const stream = api.events.mux(req({}), abort.signal)
     const pump = (async () => {
       for await (const frame of stream) {
-        frames.push(frame.payload)
+        frames.push(frame.request.payload)
         if (frames.filter(f => (f as { type: string }).type === 'session/event').length >= 2) abort.abort()
       }
     })()

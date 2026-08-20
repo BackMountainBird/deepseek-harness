@@ -13,7 +13,7 @@ import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import { DirectoryPickerError } from '@deepseek-ai/dsh-host-directory-picker'
 import type { DirectoryPickerCapability } from '@deepseek-ai/dsh-host-directory-picker'
 import WorkspaceRegistry from '@deepseek-ai/dsh-workspace'
-import type { HostFrame, WorkspaceId } from '@deepseek-ai/dsh-host-apiproxy/api'
+import type { HostFrame, StreamFrame, WorkspaceId } from '@deepseek-ai/dsh-host-apiproxy/api'
 import type { RpcRequest, RpcResponse } from '@deepseek-ai/dsh-host-apiproxy/api/rpc'
 import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api/rpc'
 import { createApiProxy } from '@deepseek-ai/dsh-host-apiproxy'
@@ -32,8 +32,8 @@ function expectOk<T>(response: RpcResponse<T>): T {
 }
 
 async function nextHostFrame(
-  stream: AsyncIterator<RpcRequest<HostFrame>>,
-): Promise<RpcRequest<HostFrame>> {
+  stream: AsyncIterator<StreamFrame<HostFrame>>,
+): Promise<StreamFrame<HostFrame>> {
   const next = await stream.next()
   if (next.done === true) throw new Error('Host stream ended before the expected increment')
   return next.value
@@ -329,7 +329,7 @@ describe('workspace.insertBefore', () => {
 
     const abort = new AbortController()
     const listWorkspaces = vi.spyOn(ctx.workspaceRegistry, 'list')
-    const stream: AsyncIterator<RpcRequest<HostFrame>> =
+    const stream: AsyncIterator<StreamFrame<HostFrame>> =
       api.events.host(request({}), abort.signal)[Symbol.asyncIterator]()
     expect(listWorkspaces).toHaveBeenCalledTimes(1)
     const changed = nextHostFrame(stream)
@@ -338,7 +338,7 @@ describe('workspace.insertBefore', () => {
       beforeWorkspaceId: second.workspaceId,
     })))
     expect(reordered.workspaceIds).toEqual([third.workspaceId, first.workspaceId, second.workspaceId])
-    expect(await changed).toMatchObject({
+    expect((await changed).request).toMatchObject({
       payload: {
         type: 'host/workspace-order-changed',
         workspaceIds: [third.workspaceId, first.workspaceId, second.workspaceId],
@@ -416,7 +416,7 @@ describe('Host Workspace increments', () => {
   it('projects subagent origin in attached summaries and creation increments', async () => {
     const { api, ctx } = await harness()
     const abort = new AbortController()
-    const stream: AsyncIterator<RpcRequest<HostFrame>> =
+    const stream: AsyncIterator<StreamFrame<HostFrame>> =
       api.events.host(request({}), abort.signal)[Symbol.asyncIterator]()
     const pending = nextHostFrame(stream)
     const childId = SessionId('session-subagent-child')
@@ -429,7 +429,7 @@ describe('Host Workspace increments', () => {
       },
     })
 
-    expect(await pending).toMatchObject({
+    expect((await pending).request).toMatchObject({
       payload: {
         type: 'host/session-added',
         sessionId: childId,
@@ -449,11 +449,11 @@ describe('Host Workspace increments', () => {
     expect(expectOk(await api.sessions.list(request({}))).items).toEqual([])
 
     const abort = new AbortController()
-    const stream: AsyncIterator<RpcRequest<HostFrame>> =
+    const stream: AsyncIterator<StreamFrame<HostFrame>> =
       api.events.host(request({}), abort.signal)[Symbol.asyncIterator]()
     const workspaceIncrement = nextHostFrame(stream)
     const workspace = expectOk(await api.workspace.create(request({ path: stageDir(root, 'project') }))).workspace
-    expect(await workspaceIncrement).toMatchObject({
+    expect((await workspaceIncrement).request).toMatchObject({
       payload: { type: 'host/workspace-changed', workspace: { workspaceId: workspace.workspaceId } },
     })
 
@@ -461,11 +461,11 @@ describe('Host Workspace increments', () => {
     const pending = nextHostFrame(stream)
     expectOk(await api.sessions.create(request({ workspaceId: workspace.workspaceId, sessionId })))
     const increments: HostFrame[] = []
-    increments.push((await pending).payload)
+    increments.push((await pending).request.payload)
     while (increments.length < 2) {
       const next = await stream.next()
       if (next.done === true) throw new Error('Host stream ended before both increments')
-      increments.push(next.value.payload)
+      increments.push(next.value.request.payload)
     }
     expect(increments.find(increment => increment.type === 'host/session-added')).toMatchObject({
       // A just-created session has no events: the frame constantly carries blank:true.
@@ -485,7 +485,7 @@ describe('Host Workspace increments', () => {
     if (domain === undefined) throw new Error('workspace domain is not open')
     vi.spyOn(domain.global, 'set').mockRejectedValueOnce(new Error('simulated registry order failure'))
     const abort = new AbortController()
-    const stream: AsyncIterator<RpcRequest<HostFrame>> =
+    const stream: AsyncIterator<StreamFrame<HostFrame>> =
       api.events.host(request({}), abort.signal)[Symbol.asyncIterator]()
     const next = stream.next()
 
@@ -503,11 +503,11 @@ describe('Host Workspace increments', () => {
     expectOk(await api.sessions.create(request({ workspaceId: workspace.workspaceId, sessionId })))
 
     const abort = new AbortController()
-    const stream: AsyncIterator<RpcRequest<HostFrame>> =
+    const stream: AsyncIterator<StreamFrame<HostFrame>> =
       api.events.host(request({}), abort.signal)[Symbol.asyncIterator]()
     const removed = nextHostFrame(stream)
     expectOk(await api.workspace.delete(request({ workspaceId: workspace.workspaceId })))
-    expect(await removed).toMatchObject({
+    expect((await removed).request).toMatchObject({
       payload: { type: 'host/workspace-removed', workspaceId: workspace.workspaceId },
     })
     expect(expectOk(await api.workspace.list(request({}))).items).toEqual([])
@@ -537,12 +537,12 @@ describe('Host Workspace increments', () => {
     expect(expectOk(await api.workspace.list(request({}))).archivedSessionIds).toEqual([])
 
     const abort = new AbortController()
-    const stream: AsyncIterator<RpcRequest<HostFrame>> =
+    const stream: AsyncIterator<StreamFrame<HostFrame>> =
       api.events.host(request({}), abort.signal)[Symbol.asyncIterator]()
     const changed = nextHostFrame(stream)
     expect(expectOk(await api.workspace.archiveSession(request({ sessionId }))).archivedSessionIds)
       .toEqual([sessionId])
-    expect(await changed).toMatchObject({
+    expect((await changed).request).toMatchObject({
       payload: { type: 'host/archived-sessions-changed', archivedSessionIds: [sessionId] },
     })
 
@@ -559,7 +559,7 @@ describe('Host Workspace increments', () => {
       .toEqual([sessionId])
     const otherSession = SessionId('session-after-archive')
     expectOk(await api.sessions.create(request({ workspaceId: workspace.workspaceId, sessionId: otherSession })))
-    expect((await after).payload.type).not.toBe('host/archived-sessions-changed')
+    expect((await after).request.payload.type).not.toBe('host/archived-sessions-changed')
 
     const missing = await api.workspace.archiveSession(request({ sessionId: SessionId('session-ghost') }))
     expect(missing.result).toMatchObject({

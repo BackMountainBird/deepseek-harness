@@ -5,42 +5,34 @@ import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
 import WebSocket, { WebSocketServer } from 'ws'
 import type {
-  ApiProxy, HostFrame, MuxFrame, RpcRequest, ServerRequest,
+  ApiProxy, HostFrame, MuxFrame, RpcRequest, StreamFrame,
 } from '@deepseek-ai/dsh-host-apiproxy/api'
-import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api'
+import { RpcId, serializeStreamFrame } from '@deepseek-ai/dsh-host-apiproxy/api'
 
 type Frame = MuxFrame | HostFrame
 
-function serverRequest(frame: RpcRequest<Frame>): ServerRequest {
-  return {
-    type: 'server-request',
-    rpcId: frame.rpcId,
-    method: frame.payload.type,
-    payload: frame.payload,
-  }
-}
-
-function send(socket: WebSocket, frame: RpcRequest<Frame>): Promise<void> {
+function send(socket: WebSocket, wire: string): Promise<void> {
   return new Promise((resolve, reject) => {
     if (socket.readyState !== WebSocket.OPEN) {
       reject(new Error('websocket downlink closed before frame delivery'))
       return
     }
-    socket.send(JSON.stringify(serverRequest(frame)), (error) => {
+    socket.send(wire, (error) => {
       if (error) reject(error)
       else resolve()
     })
   })
 }
 
-function failureFrame(error: unknown): RpcRequest<Frame> {
-  return {
+function failureFrame(error: unknown): StreamFrame<Frame> {
+  const request: RpcRequest<Frame> = {
     rpcId: RpcId(randomUUID()),
     payload: {
       type: 'stream/error',
       error: { code: 'internal', message: String(error), details: {} },
     },
   }
+  return { request, wire: serializeStreamFrame(request) }
 }
 
 /**
@@ -100,7 +92,7 @@ export class WebSocketDownlinks {
     req: IncomingMessage,
     socket: Duplex,
     head: Buffer,
-    open: (signal: AbortSignal) => AsyncIterable<RpcRequest<F>>,
+    open: (signal: AbortSignal) => AsyncIterable<StreamFrame<F>>,
   ): void {
     this.server.handleUpgrade(req, socket, head, (websocket) => {
       const abort = new AbortController()
@@ -117,15 +109,17 @@ export class WebSocketDownlinks {
 
   private async pump<F extends Frame>(
     socket: WebSocket,
-    frames: AsyncIterable<RpcRequest<F>>,
+    frames: AsyncIterable<StreamFrame<F>>,
     abort: AbortController,
   ): Promise<void> {
     try {
-      for await (const frame of frames) await send(socket, frame)
+      // Each frame's wire bytes were serialized once upstream and are shared
+      // by every consumer, so this carrier only writes them per socket.
+      for await (const frame of frames) await send(socket, frame.wire)
     } catch (error) {
       if (!abort.signal.aborted) {
         try {
-          await send(socket, failureFrame(error))
+          await send(socket, failureFrame(error).wire)
         } catch {
           // Socket loss won the race; no downstream remains to receive the failure frame.
         }

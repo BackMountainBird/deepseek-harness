@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { ApiProxy, HostFrame, MuxFrame } from '../src/api/index.ts'
+import type { ApiProxy, HostFrame, MuxFrame, StreamFrame } from '../src/api/index.ts'
 import type { ClientResponse, RpcMessage, RpcReceipt, RpcRequest } from '../src/api/rpc.ts'
 import { RpcId } from '../src/api/rpc.ts'
+import { serializeStreamFrame } from '../src/api/index.ts'
 import { toFetchHandler } from '../src/fetch/handler.ts'
 import { AbstractApiClient, InProcessApiClient } from '../src/fetch/client.ts'
 
@@ -9,10 +10,11 @@ import { AbstractApiClient, InProcessApiClient } from '../src/fetch/client.ts'
 function fakeApi(overrides: Partial<{ muxFrames: MuxFrame[]; hostFrames: HostFrame[]; crashOn: string }> = {}): ApiProxy {
   const muxFrames = overrides.muxFrames ?? [{ type: 'session/subscribed', sessionId: 's1' as never, lastSeq: -1 }]
   const hostFrames = overrides.hostFrames ?? [{ type: 'host/session-removed', sessionId: 's1' as never }]
-  async function * stream<F>(frames: F[], signal: AbortSignal): AsyncGenerator<RpcRequest<F>> {
+  async function * stream<F extends MuxFrame | HostFrame>(frames: F[], signal: AbortSignal): AsyncGenerator<StreamFrame<F>> {
     for (const payload of frames) {
       if (signal.aborted) return
-      yield { rpcId: RpcId(`frame-${String(frames.indexOf(payload))}`), payload }
+      const request: RpcRequest<F> = { rpcId: RpcId(`frame-${String(frames.indexOf(payload))}`), payload }
+      yield { request, wire: serializeStreamFrame(request) }
     }
   }
   return {
@@ -695,8 +697,9 @@ describe('SSE streams through the carrier', () => {
 
   it('surfaces a mid-stream impl failure as one stream/error frame, then the stream ends', async () => {
     const api = fakeApi()
-    api.events.mux = (_request, _signal) => (async function * (): AsyncGenerator<RpcRequest<MuxFrame>> {
-      yield { rpcId: RpcId('f0'), payload: { type: 'session/subscribed', sessionId: 's' as never, lastSeq: -1 } }
+    api.events.mux = (_request, _signal) => (async function * (): AsyncGenerator<StreamFrame<MuxFrame>> {
+      const request: RpcRequest<MuxFrame> = { rpcId: RpcId('f0'), payload: { type: 'session/subscribed', sessionId: 's' as never, lastSeq: -1 } }
+      yield { request, wire: serializeStreamFrame(request) }
       throw new Error('stream source died')
     })()
     const frames = await collect(client(api).events.mux({}, new AbortController().signal))

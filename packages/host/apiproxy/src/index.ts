@@ -24,6 +24,7 @@ import {
 
 export type * from './api/index.ts'
 export { RpcId } from './api/rpc.ts'
+export { serializeStreamFrame } from './api/index.ts'
 export { toFetchHandler } from './fetch/handler.ts'
 export { AbstractApiClient, InProcessApiClient } from './fetch/client.ts'
 export type { IApiClient } from './fetch/client.ts'

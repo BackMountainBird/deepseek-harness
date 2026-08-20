@@ -386,8 +386,8 @@ describe('agentPreset.select', () => {
     const stream = api.events.host(request({}), abort.signal)
     const consume = (async () => {
       for await (const frame of stream) {
-        if (frame.payload.type === 'host/remote-event'
-          && frame.payload.event === 'agent-preset/selected') frames.push(frame.payload)
+        if (frame.request.payload.type === 'host/remote-event'
+          && frame.request.payload.event === 'agent-preset/selected') frames.push(frame.request.payload)
       }
     })()
 

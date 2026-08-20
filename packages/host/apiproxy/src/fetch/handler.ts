@@ -8,10 +8,11 @@
 
 import { randomUUID } from 'node:crypto'
 import type { z } from 'zod'
-import type { ApiProxy, MuxFrame, HostFrame } from '../api/index.ts'
+import type { ApiProxy, MuxFrame, HostFrame, StreamFrame } from '../api/index.ts'
+import { serializeStreamFrame } from '../api/index.ts'
 import { sessionLogQuerySchema } from '../api/downloads.schema.ts'
 import type { RequestPayload, ResponseValue, RpcMethodMap } from '../api/rpc-map.ts'
-import type { ClientRequest, RpcError, RpcRequest, RpcResponse, ServerRequest, ServerResponse } from '../api/rpc.ts'
+import type { ClientRequest, RpcError, RpcRequest, RpcResponse, ServerResponse } from '../api/rpc.ts'
 import { RpcId } from '../api/rpc.ts'
 import type { Wire } from '../api/rpc.schema.ts'
 import { clientRequestSchema, clientResponseSchema } from '../api/rpc.schema.ts'
@@ -191,16 +192,13 @@ async function handleUnary<K extends keyof RpcMethodMap>(
   }
 }
 
-/** SSE frame: complete the narrow RpcRequest<frame> into a ServerRequest full form (method = frame type). */
-function fullFrame(narrow: RpcRequest<MuxFrame | HostFrame>): ServerRequest {
-  return { type: 'server-request', rpcId: narrow.rpcId, method: narrow.payload.type, payload: narrow.payload }
-}
-
 /**
  * Wrap a frame stream as an SSE Response; stops when req.signal aborts. An
- * impl throw mid-stream emits one stream/error frame and then closes.
+ * impl throw mid-stream emits one stream/error frame and then closes. Each
+ * frame's wire bytes were serialized once upstream, so this carrier only
+ * prefixes them with the SSE data line.
  */
-function sseResponse(frames: AsyncIterable<RpcRequest<MuxFrame | HostFrame>>): Response {
+function sseResponse(frames: AsyncIterable<StreamFrame<MuxFrame | HostFrame>>): Response {
   const encoder = new TextEncoder()
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -209,8 +207,8 @@ function sseResponse(frames: AsyncIterable<RpcRequest<MuxFrame | HostFrame>>): R
         // stream has no baseline frames and would otherwise emit zero bytes while idle;
         // a comment line is not a frame, so client frame parsing skips it naturally).
         controller.enqueue(encoder.encode(': connected\n\n'))
-        for await (const narrow of frames) {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(fullFrame(narrow))}\n\n`))
+        for await (const frame of frames) {
+          controller.enqueue(encoder.encode(`data: ${frame.wire}\n\n`))
         }
       } catch (error: unknown) {
         // Mid-stream impl failure → one stream/error frame, then close: the client must see
@@ -218,7 +216,7 @@ function sseResponse(frames: AsyncIterable<RpcRequest<MuxFrame | HostFrame>>): R
         // rpcId is minted — this is a server-initiated push like any other frame.
         const failure: MuxFrame | HostFrame = { type: 'stream/error', error: { code: 'internal', message: String(error), details: {} } }
         try {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(fullFrame({ rpcId: RpcId(randomUUID()), payload: failure }))}\n\n`))
+          controller.enqueue(encoder.encode(`data: ${serializeStreamFrame({ rpcId: RpcId(randomUUID()), payload: failure })}\n\n`))
         } catch {
           // Consumer already cancelled the stream: enqueue-after-cancel is the
           // only reachable error, and there is no one left to tell.

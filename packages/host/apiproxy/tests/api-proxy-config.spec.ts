@@ -208,8 +208,8 @@ async function collectHost(
   const stream = api.events.host(request({}), abort.signal)
   const consume = (async () => {
     for await (const frame of stream) {
-      if (!types.includes(frame.payload.type)) continue
-      frames.push(frame.payload)
+      if (!types.includes(frame.request.payload.type)) continue
+      frames.push(frame.request.payload)
       if (frames.length >= count) abort.abort()
     }
   })()
