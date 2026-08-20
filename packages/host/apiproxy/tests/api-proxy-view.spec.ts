@@ -19,7 +19,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
-import type { MuxFrame, RpcRequest } from '@deepseek-ai/dsh-host-apiproxy/api'
+import type { MuxFrame, StreamFrame } from '@deepseek-ai/dsh-host-apiproxy/api'
 import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api/rpc'
 import { createApiProxy } from '@deepseek-ai/dsh-host-apiproxy'
 
@@ -93,10 +93,10 @@ async function harness(): Promise<{ ctx: Context }> {
 }
 
 /** Drain frames from an open mux stream until `count` session/event frames arrived. */
-async function collect(iterable: AsyncIterable<RpcRequest<MuxFrame>>, count: number, abort: AbortController): Promise<MuxFrame[]> {
+async function collect(iterable: AsyncIterable<StreamFrame<MuxFrame>>, count: number, abort: AbortController): Promise<MuxFrame[]> {
   const frames: MuxFrame[] = []
   for await (const frame of iterable) {
-    frames.push(frame.payload)
+    frames.push(frame.request.payload)
     if (frames.filter(f => f.type === 'session/event').length >= count) abort.abort()
   }
   return frames
@@ -370,5 +370,59 @@ describe('mux live view computation', () => {
     const frames = await collected
     const result = frames.find(f => f.type === 'session/event' && f.event.type === 'tool/result')
     expect(result?.type === 'session/event' && result.view).toEqual({ for: 'result', view: { card: 'terminal', output: 'done' } })
+  })
+})
+
+describe('mux broadcast fanout', () => {
+  it('delivers the same serialized item to every consumer and no-ops without consumers', async () => {
+    const { ctx } = await harness()
+    const api = createApiProxy(ctx, { defaultModelSelection: () => ({ provider: 'p', model: 'm' }), cwd: '/tmp' })
+
+    // Events appended with no open stream reach no consumer.
+    const quiet = ctx.sessions.create()
+    quiet.append('turn/start', { turn: 1 })
+
+    const abortA = new AbortController()
+    const abortB = new AbortController()
+    const itemsA: StreamFrame<MuxFrame>[] = []
+    const itemsB: StreamFrame<MuxFrame>[] = []
+    const drain = async (
+      stream: AsyncIterable<StreamFrame<MuxFrame>>,
+      into: StreamFrame<MuxFrame>[],
+      abort: AbortController,
+    ): Promise<void> => {
+      for await (const item of stream) {
+        into.push(item)
+        if (item.request.payload.type === 'session/event') abort.abort()
+      }
+    }
+    const drainedA = drain(api.events.mux({ rpcId: RpcId('t-share-a'), payload: {} }, abortA.signal), itemsA, abortA)
+    const drainedB = drain(api.events.mux({ rpcId: RpcId('t-share-b'), payload: {} }, abortB.signal), itemsB, abortB)
+
+    const session = ctx.sessions.create()
+    session.append('turn/start', { turn: 1 })
+    await Promise.all([drainedA, drainedB])
+
+    const eventA = itemsA.find(item => item.request.payload.type === 'session/event')
+    const eventB = itemsB.find(item => item.request.payload.type === 'session/event')
+    // One mint, one serialization: both consumers receive the identical item.
+    expect(eventA).toBeDefined()
+    expect(eventA).toBe(eventB)
+    const parsed = JSON.parse(String(eventA?.wire)) as {
+      type: string
+      rpcId: string
+      method: string
+      payload: MuxFrame
+    }
+    expect(parsed.type).toBe('server-request')
+    expect(parsed.rpcId).toBe(eventA?.request.rpcId)
+    expect(parsed.method).toBe('session/event')
+    expect(parsed.payload).toEqual(eventA?.request.payload)
+    // Neither consumer saw the quiet session's pre-open event.
+    const sawQuiet = (items: StreamFrame<MuxFrame>[]): boolean => items.some(item =>
+      item.request.payload.type === 'session/event'
+      && (item.request.payload as { sessionId: SessionId }).sessionId === quiet.id)
+    expect(sawQuiet(itemsA)).toBe(false)
+    expect(sawQuiet(itemsB)).toBe(false)
   })
 })

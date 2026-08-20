@@ -16,7 +16,7 @@ import type { Session } from '@deepseek-ai/dsh-session'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import LocalJobRegistry from '@deepseek-ai/dsh-jobs-local'
 import type { JobOutcome } from '@deepseek-ai/dsh-jobs'
-import type { MuxFrame, RpcRequest } from '@deepseek-ai/dsh-host-apiproxy/api'
+import type { MuxFrame, StreamFrame } from '@deepseek-ai/dsh-host-apiproxy/api'
 import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api/rpc'
 import { createApiProxy } from '@deepseek-ai/dsh-host-apiproxy'
 
@@ -69,13 +69,13 @@ const api = (ctx: Context) => createApiProxy(ctx, { defaultModelSelection: () =>
 
 /** Drain the mux until `count` session/jobs frames arrived, then abort. */
 async function collect(
-  iterable: AsyncIterable<RpcRequest<MuxFrame>>,
+  iterable: AsyncIterable<StreamFrame<MuxFrame>>,
   count: number,
   abort: AbortController,
 ): Promise<JobFrame[]> {
   const frames: MuxFrame[] = []
   for await (const envelope of iterable) {
-    frames.push(envelope.payload)
+    frames.push(envelope.request.payload)
     if (frames.filter(frame => frame.type === 'session/jobs').length >= count) abort.abort()
   }
   return frames.filter((frame): frame is JobFrame => frame.type === 'session/jobs')
@@ -89,7 +89,7 @@ describe('session/jobs subscription baseline', () => {
     const frames: MuxFrame[] = []
     const drained = (async () => {
       for await (const envelope of stream) {
-        frames.push(envelope.payload)
+        frames.push(envelope.request.payload)
         if (frames.some(frame => frame.type === 'session/subscribed')) abort.abort()
       }
     })()
@@ -199,7 +199,7 @@ describe('session/jobs without the registry', () => {
     const frames: MuxFrame[] = []
     const drained = (async () => {
       for await (const envelope of stream) {
-        frames.push(envelope.payload)
+        frames.push(envelope.request.payload)
         if (frames.filter(frame => frame.type === 'session/event').length >= 1) abort.abort()
       }
     })()

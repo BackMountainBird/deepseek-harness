@@ -22,6 +22,8 @@ Settings 分节中的 `reasoningEffort` 在 agent-default-model 插件配置中�
 
 分层与协议决策记录在 [GUI 分层与 RPC 协议 RFC](../../../.agents/notes/implemented/architecture/2026-07-19-gui-layering-and-rpc-protocol.md) 中；浏览器侧消费架构记录在 [Web 客户端架构 RFC](../../../.agents/notes/implemented/architecture/2026-07-19-gui-web-client-architecture.md) 中。
 
+两条事件流（`events.mux`、`events.host`）产出 `StreamFrame` 条目：`RpcRequest` 帧加上预序列化的 wire 字节。广播帧只铸造和序列化一次，每个载体（WebSocket 下行、SSE GET）逐字发送同一份字节，因此每消费方成本是一次 socket 写入。mux 热路径监听器（`session/event`、`session/created`、`session/disposed`、jobs 变更）在首次打开流时注册一次并由所有消费方共享；没有连接打开时，监听器对队列计数直接空转返回。
+
 首个回答认领待处理请求之前，系统会对照该请求校验问题响应。多选题的回答项可以同时携带 `selected` 中的请求选项标签与非空 `custom` 文本；单选题的回答项必须二选一。标签重复、标签未知、id 不匹配、批次不完整以及自定义文本为空都会以 `bad-response` 拒绝。
 
 `session.history` 会读取已附加 Session 的内存状态，或通过持久化检查冷日志，而不会恢复或发布 agent，然后按追加来源的消息边界分页：`maxMessages` 统计以追加方式进入 surface 的 `user/message` 和 `assistant/message` 事件，因此仅供模型使用的替换副本不占用配额。每一页仍是一段连续的原始事件区间，从而让压缩（compaction）的仅日志 `compaction/summary` 记录与引用它的替换留在同一页。
