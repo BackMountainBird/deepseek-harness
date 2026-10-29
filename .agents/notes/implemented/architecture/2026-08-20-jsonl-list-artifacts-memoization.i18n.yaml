@@ -1,6 +1,19 @@
-# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
-# side as of the last confirmed-consistent state. Both languages carry equal authority;
-# after editing either side, bring the other along and re-record with:
+# Bilingual-pair consistency record for 2026-08-20-jsonl-list-artifacts-memoization.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write .agents/notes/implemented/architecture/2026-08-20-jsonl-list-artifacts-memoization.md
-2026-08-20-jsonl-list-artifacts-memoization.md: b97c2fe4c57910dec8582b09b21f6ee7345736f7
-2026-08-20-jsonl-list-artifacts-memoization.zh.md: d83b8f0abff4d1463b9bb5acc96ab5a3d18a7426
+/agent-note-jsonl-listing-probes-stats-and-memoizes-header-lines:
+  en: 5f328b4e5c5940da
+  zh: b87ac0f647c8192a
+/agent-note-jsonl-listing-probes-stats-and-memoizes-header-lines/problem:
+  en: 2b81d865a138fbb4
+  zh: e922de1a17b1f6de
+/agent-note-jsonl-listing-probes-stats-and-memoizes-header-lines/decision:
+  en: 0f19291e4c7856c8
+  zh: eec64a5d96749334
+/agent-note-jsonl-listing-probes-stats-and-memoizes-header-lines/consequences:
+  en: 667b84d99d7fc445
+  zh: 3701151ae22cdead
+/agent-note-jsonl-listing-probes-stats-and-memoizes-header-lines/alternatives-considered:
+  en: b9108514594e5bfc
+  zh: ee4412d91f4005e3
